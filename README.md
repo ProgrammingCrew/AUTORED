@@ -1,7 +1,7 @@
 # AUTORED
 ***
 ## DESCRIPCIÓN
-AutoRed es una plataforma web inteligente que centraliza la información de refaccionarias y distribuidoras para optimizar la gestión de inventarios y la búsqueda de autopartes. Permite administrar el stock en tiempo real, realizar búsquedas con filtros avanzados (marca, modelo, fabricante, precio y ubicación) e integrar un chatbot con IA que sugiere piezas compatibles, evalúa la vida útil y ofrece alternativas ante la falta de inventario, todo bajo un entorno digital seguro.
+AutoRed es una plataforma web inteligente que centraliza la información de refaccionarias y distribuidoras para optimizar la gestión de inventarios y la búsqueda de autopartes. Permite administrar el stock en tiempo real incorporando integración IoT mediante un lector de código QR para el registro ágil de productos, realizar búsquedas con filtros avanzados (marca, modelo, fabricante, precio y ubicación) e integrar un chatbot con IA que sugiere piezas compatibles, evalúa la vida útil y ofrece alternativas ante la falta de inventario, todo bajo un entorno digital seguro.
 
 ## OBJETIVO
 Desarrollar la plataforma web inteligente AutoRed centralizada y segura, que optimice la administración de inventarios en tiempo real y agilice la localización e interconexión de autopartes entre refaccionarias, distribuidores y compradores.
