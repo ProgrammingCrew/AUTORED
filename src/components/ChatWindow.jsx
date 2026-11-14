@@ -2,6 +2,32 @@ import { useState, useRef, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown'; // 🔥 IMPORTAMOS REACT-MARKDOWN 🔥
 
+// ==========================================
+// 🛡️ Validaciones del lado del cliente (respuesta inmediata al usuario).
+// Las mismas reglas se vuelven a aplicar en api/chat.js, que es la que cuenta.
+// ==========================================
+const CHAT_URL = import.meta.env.VITE_CHAT_URL || '/api/chat';
+const MAX_CHARS = 90;
+
+const validarMensajeChatbot = (mensaje) => {
+  if (typeof mensaje !== 'string' || mensaje.trim() === '') return null;
+  if (mensaje.length > MAX_CHARS) return null;
+  return mensaje.replace(/[\x00-\x1F\x7F]/g, '').trim();
+};
+
+const normalizar = (s) => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+const FRASES_BLOQUEADAS = [
+  'ignora las instrucciones', 'olvida las reglas', 'revela tu prompt',
+  'contraseñas', 'actúa como administrador', 'dame la base de datos',
+  'claves api', 'borra los registros', 'ejecuta', 'system prompt'
+].map(normalizar);
+
+const pasaFirewall = (mensaje) => {
+  const m = normalizar(mensaje);
+  return !FRASES_BLOQUEADAS.some((frase) => m.includes(frase));
+};
+
 export default function ChatWindow() {
   
   const [isOpen, setIsOpen] = useState(false);
@@ -50,72 +76,83 @@ export default function ChatWindow() {
     } catch (e) { return "invitado"; }
     return "invitado";
   };
+  const agregarMensajeBot = (texto) => {
+    setMessages(prev => [...prev, { text: texto, isBot: true }]);
+  };
 
- const handleSend = async (e) => {
+  const handleSend = async (e) => {
     e.preventDefault();
-    if (!inputMsg.trim()) return;
+    if (isLoading || !inputMsg.trim()) return;
 
-    const userText = inputMsg;
+    // 🛡️ 1. Validación contra gasto de tokens
+    const userText = validarMensajeChatbot(inputMsg);
+    if (userText === null) {
+      agregarMensajeBot(`Tu mensaje es inválido o demasiado largo (máximo ${MAX_CHARS} caracteres).`);
+      return;
+    }
+
     setMessages(prev => [...prev, { text: userText, isBot: false }]);
     setInputMsg('');
+
+    // 🛡️ 2. Prompt firewall (anti-injection)
+    if (!pasaFirewall(userText)) {
+      agregarMensajeBot('Lo siento, por políticas de seguridad de AutoRed no puedo procesar esa solicitud. 🛡️');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
       const rolUsuario = obtenerRolActual();
-      
-      const response = await fetch('https://backautored-production.up.railway.app/api/chat/mensaje', {
-        method: 'POST', 
+
+      const response = await fetch(CHAT_URL, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          mensaje: userText,
-          rol: rolUsuario 
-        })
+        body: JSON.stringify({ mensaje: userText, rol: rolUsuario })
       });
 
-      // 🔥 ELIMINAMOS EL if (!response.ok). AHORA SIEMPRE LEEMOS EL JSON 🔥
-      const data = await response.json();
-      
+      // Siempre leemos el JSON (el servidor responde con { rawJson } aun en errores)
+      let data = {};
+      try { data = await response.json(); } catch (_) { data = {}; }
+
       let respuestaIA;
-      try {
-        // Verificamos si existe rawJson
-        if (data.rawJson) {
+      if (data.rawJson) {
+        try {
           respuestaIA = JSON.parse(data.rawJson);
-        } else {
-          // Por si el backend manda el error directamente en data.mensaje
-          respuestaIA = { mensaje: data.mensaje || "Respuesta vacía del servidor", accion: 'NINGUNA' };
+        } catch (parseError) {
+          console.warn('La IA no devolvió un JSON perfecto, usando texto crudo.');
+          respuestaIA = { mensaje: data.rawJson, accion: 'NINGUNA' };
         }
-      } catch (parseError) {
-        console.warn("La IA no devolvió un JSON perfecto, usando texto crudo.");
-        respuestaIA = { mensaje: data.rawJson || "Error procesando el texto.", accion: 'NINGUNA' };
+      } else {
+        respuestaIA = { mensaje: 'No pude procesar tu mensaje. Intenta de nuevo. 🔧', accion: 'NINGUNA' };
       }
 
-      setMessages(prev => [...prev, { text: respuestaIA.mensaje, isBot: true }]);
+      agregarMensajeBot(String(respuestaIA.mensaje ?? ''));
 
-      const accion = respuestaIA.accion ? respuestaIA.accion.trim() : 'NINGUNA';
+      const accion = respuestaIA.accion ? String(respuestaIA.accion).trim() : 'NINGUNA';
 
       if (accion !== 'NINGUNA') {
         setTimeout(() => {
           if (accion === 'OPEN_PRODUCT' && respuestaIA.producto_id) {
             navigate(`/producto/${respuestaIA.producto_id}`);
-          } 
-          else {
-            switch(accion) {
+          } else {
+            switch (accion) {
               case 'NAVIGATE_CATALOG': navigate('/catalogo'); break;
               case 'NAVIGATE_HOME': navigate('/inicio'); break;
               case 'NAVIGATE_GARAGE': navigate('/dashboard/customer'); break;
               case 'NAVIGATE_MY_INVENTORY': navigate('/dashboard/store'); break;
               case 'NAVIGATE_USERS':
               case 'NAVIGATE_STORES': navigate('/dashboard/admin'); break;
-              default: console.log("Acción desconocida:", accion); break;
+              default: console.log('Acción desconocida:', accion); break;
             }
           }
-        }, 1500); 
+        }, 1500);
       }
-      
+
     } catch (error) {
-      // ESTE CATCH AHORA SOLO SE EJECUTA SI DE VERDAD SE CAE EL INTERNET 📡
-      console.error("🔴 Error de Red / Conexión:", error);
-      setMessages(prev => [...prev, { text: "Error de conexión. Revisa tu internet. 📡", isBot: true }]);
+      // Solo se ejecuta si de verdad no hay conexión con el servidor 📡
+      console.error('🔴 Error de Red / Conexión:', error);
+      agregarMensajeBot('Error de conexión. Revisa tu internet. 📡');
     } finally {
       setIsLoading(false);
     }
@@ -201,7 +238,8 @@ export default function ChatWindow() {
             <input 
               type="text" 
               value={inputMsg}
-              onChange={(e) => setInputMsg(e.target.value)}
+              onChange={(e) => setInputMsg(e.target.value.slice(0, MAX_CHARS))}
+              maxLength={MAX_CHARS}
               placeholder="Pregúntame lo que necesites..." 
               className="flex-1 bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-autoblue/20 focus:border-autoblue transition-all"
             />
