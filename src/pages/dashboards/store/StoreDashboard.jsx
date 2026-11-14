@@ -1,6 +1,8 @@
 import { useNavigate, Link } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import GestorExcel from './components/GestorExcel';
+import useScanner from '../../../hooks/useScanner';
+import { supabase } from '../../../supabase';
 
 // --- DICCIONARIOS LOCALES ---
 const vehiculosDb = {
@@ -58,12 +60,31 @@ export default function StoreDashboard() {
     stock: 1, precio_lista: 0, precio_oferta: 0, establecimiento_id: '',
     tipo_vehiculo: 'Auto', marca_vehiculo: '', modelo: '', anio_vehiculo: '', imagen_url: '',
     // Nuevas columnas estructurales
-    numero_parte: '', condicion: 'Nueva', garantia: ''
+    numero_parte: '', codigo_barras: '', condicion: 'Nueva', garantia: ''
   });
 
   const mostrarNotificacion = (mensaje, tipo = 'exito') => {
     setNotificacion({ visible: true, mensaje, tipo });
     setTimeout(() => setNotificacion({ visible: false, mensaje: '', tipo: 'exito' }), 3500);
+  };
+
+  // El backend de Java no conoce la columna codigo_barras, así que la leemos directo de Supabase
+  // y la mezclamos en cada pieza (item.pieza.codigo_barras). Si falla, el panel sigue funcionando sin ella.
+  const agregarCodigosDeBarras = async (items, tiendaId) => {
+    try {
+      const { data, error } = await supabase
+        .from('inventarios')
+        .select('id, piezas(codigo_barras)')
+        .eq('establecimiento_id', tiendaId);
+      if (error || !data) return items;
+      const mapa = new Map(data.map(r => {
+        const pz = Array.isArray(r.piezas) ? r.piezas[0] : r.piezas;
+        return [r.id, pz?.codigo_barras || ''];
+      }));
+      return items.map(it => ({ ...it, pieza: { ...it.pieza, codigo_barras: mapa.get(it.id) || '' } }));
+    } catch {
+      return items;
+    }
   };
 
   const inicializarPanel = async () => {
@@ -83,7 +104,7 @@ export default function StoreDashboard() {
             fetch('https://backautored-production.up.railway.app/api/inventario/todos')
           ]);
 
-          if (resLocal.ok) setInventarioLocal(await resLocal.json());
+          if (resLocal.ok) setInventarioLocal(await agregarCodigosDeBarras(await resLocal.json(), miTienda.id));
           if (resGlobal.ok) setInventarioGlobal(await resGlobal.json());
         }
       }
@@ -110,12 +131,59 @@ export default function StoreDashboard() {
       marca_vehiculo: item.pieza?.marca_vehiculo || '', modelo: item.pieza?.modelo || '',
       anio_vehiculo: item.pieza?.anio_vehiculo || '', imagen_url: item.pieza?.imagen_url || '',
       // Mapeo de nuevos campos al editar
-      numero_parte: item.pieza?.numero_parte || '', condicion: item.pieza?.condicion || 'Nueva',
+      numero_parte: item.pieza?.numero_parte || '', codigo_barras: item.pieza?.codigo_barras || '',
+      condicion: item.pieza?.condicion || 'Nueva',
       garantia: 'Sin garantía'
     });
     setShowForm(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
+
+  // --- ESCÁNER DE CÓDIGO DE BARRAS (lector USB/Bluetooth en modo teclado) ---
+  const manejarEscaneo = (codigoCrudo) => {
+    const codigo = codigoCrudo.trim();
+    if (!codigo || !miEstablecimiento) return;
+    const c = codigo.toLowerCase();
+
+    const existente = inventarioLocal.find(item =>
+      item.pieza?.codigo_barras?.toLowerCase() === c ||
+      item.pieza?.numero_parte?.toLowerCase() === c
+    );
+
+    // 1) Formulario abierto: el código se guarda en el campo "Código de Barras"
+    if (showForm) {
+      setFormData(prev => ({ ...prev, codigo_barras: codigo }));
+      if (existente && existente.id !== idEdicion) {
+        mostrarNotificacion(`Ese código ya existe en tu inventario: ${existente.pieza?.nombre_comercial}`, 'error');
+      } else {
+        mostrarNotificacion(`Código capturado: ${codigo}`);
+      }
+      return;
+    }
+
+    // 2) Formulario cerrado y la pieza ya existe: abrimos su edición
+    if (existente) {
+      mostrarNotificacion(`Pieza encontrada: ${existente.pieza?.nombre_comercial}`);
+      cargarDatosParaEdicion(existente);
+      return;
+    }
+
+    // 3) Formulario cerrado y código desconocido: abrimos un alta nueva con el código precargado
+    setIdEdicion(null);
+    setImagenSeleccionada(null);
+    setFormData({
+      categoria: 'Motor', marca: '', nombre_comercial: '', descripcion: '', fabricante_original: '',
+      nivel_calidad: 'Premium', tiempo_duracion: '', stock: 1, precio_lista: 0, precio_oferta: 0,
+      establecimiento_id: miEstablecimiento.id, tipo_vehiculo: 'Auto', marca_vehiculo: '', modelo: '', anio_vehiculo: '', imagen_url: '',
+      numero_parte: '', codigo_barras: codigo, condicion: 'Nueva', garantia: ''
+    });
+    setShowForm(true);
+    mostrarNotificacion(`Código nuevo (${codigo}). Completa los datos de la pieza.`);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // Solo escucha el escáner cuando estás en la pestaña de inventario local
+  useScanner(manejarEscaneo, { enabled: activeTab === 'catalog' && !!miEstablecimiento });
 
   const handleInputChange = (e) => {
     const { name, value } = e.target;
@@ -167,6 +235,36 @@ export default function StoreDashboard() {
     return data.url; 
   };
 
+  // Guarda el código de barras directo en Supabase (tabla piezas), sin pasar por el backend de Java
+  const guardarCodigoBarras = async (codigo, idInventario, numeroParte) => {
+    try {
+      const valor = codigo?.trim() || null;
+      let piezaId = null;
+
+      if (idInventario) {
+        // Edición: sabemos el id del inventario, de ahí sacamos la pieza
+        const { data } = await supabase.from('inventarios').select('pieza_id').eq('id', idInventario).maybeSingle();
+        piezaId = data?.pieza_id;
+      } else {
+        // Alta nueva: buscamos la pieza recién creada en esta tienda por su número de parte
+        const { data } = await supabase
+          .from('inventarios')
+          .select('pieza_id, piezas!inner(numero_parte)')
+          .eq('establecimiento_id', miEstablecimiento.id)
+          .eq('piezas.numero_parte', numeroParte)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        piezaId = data?.[0]?.pieza_id;
+      }
+      if (!piezaId) return false;
+
+      const { error } = await supabase.from('piezas').update({ codigo_barras: valor }).eq('id', piezaId);
+      return !error;
+    } catch {
+      return false;
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!miEstablecimiento) {
@@ -180,7 +278,9 @@ export default function StoreDashboard() {
         mostrarNotificacion("Subiendo imagen a la nube...");
         urlFinalImagen = await subirImagenASupabase(imagenSeleccionada);
       }
-      const payloadCompleto = { ...formData, imagen_url: urlFinalImagen };
+      // codigo_barras NO se manda a Java: se guarda aparte, directo en Supabase
+      const { codigo_barras: codigoBarras, ...datosParaJava } = formData;
+      const payloadCompleto = { ...datosParaJava, imagen_url: urlFinalImagen };
       const urlFetch = idEdicion ? `https://backautored-production.up.railway.app/api/inventario/actualizar/${idEdicion}` : 'https://backautored-production.up.railway.app/api/inventario/agregar';
       const metodoFetch = idEdicion ? 'PUT' : 'POST';
       
@@ -191,13 +291,21 @@ export default function StoreDashboard() {
       });
 
       if (response.ok) {
-        mostrarNotificacion(idEdicion ? "¡Producto actualizado correctamente!" : "¡Refacción guardada exitosamente!");
+        let codigoGuardado = true;
+        if (codigoBarras?.trim() || idEdicion) {
+          codigoGuardado = await guardarCodigoBarras(codigoBarras, idEdicion, formData.numero_parte);
+        }
+        if (codigoGuardado) {
+          mostrarNotificacion(idEdicion ? "¡Producto actualizado correctamente!" : "¡Refacción guardada exitosamente!");
+        } else {
+          mostrarNotificacion("La pieza se guardó, pero no se pudo guardar el código de barras.", "error");
+        }
         setShowForm(false); setIdEdicion(null); setImagenSeleccionada(null);
         setFormData({
           categoria: 'Motor', marca: '', nombre_comercial: '', descripcion: '', fabricante_original: '',
           nivel_calidad: 'Premium', tiempo_duracion: '', stock: 1, precio_lista: 0, precio_oferta: 0,
           establecimiento_id: miEstablecimiento.id, tipo_vehiculo: 'Auto', marca_vehiculo: '', modelo: '', anio_vehiculo: '', imagen_url: '',
-          numero_parte: '', condicion: 'Nueva', garantia: ''
+          numero_parte: '', codigo_barras: '', condicion: 'Nueva', garantia: ''
         });
         inicializarPanel();
       } else {
@@ -244,7 +352,13 @@ export default function StoreDashboard() {
         {activeTab === 'catalog' && (
           <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm animate-fade-in">
             <div className="flex justify-between items-center mb-6">
-              <h3 className="font-bold text-lg text-gray-900">Gestión de Stock</h3>
+              <div>
+                <h3 className="font-bold text-lg text-gray-900">Gestión de Stock</h3>
+                <p className="text-xs text-gray-500 mt-0.5 flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
+                  Lector de códigos activo: escanea una caja para buscar la pieza o registrar una nueva
+                </p>
+              </div>
               <button onClick={() => {
                 setShowForm(!showForm);
                 if(showForm) setIdEdicion(null);
@@ -324,6 +438,20 @@ export default function StoreDashboard() {
                         <option value="1 año">1 año (Fábrica)</option>
                       </select>
                     </div>
+                  </div>
+                  {/* CÓDIGO DE BARRAS / QR (se llena solo al escanear) */}
+                  <div className="mt-4">
+                    <label className="block text-xs font-black uppercase text-gray-500 mb-1">Código de Barras / QR <span className="lowercase font-normal text-autoblue">(Opcional — escanea la caja con el lector)</span></label>
+                    <input
+                      type="text"
+                      name="codigo_barras"
+                      data-scanner="true"
+                      value={formData.codigo_barras}
+                      onChange={handleInputChange}
+                      onKeyDown={(e) => { if (e.key === 'Enter') e.preventDefault(); }}
+                      className="w-full bg-white border border-gray-200 rounded-lg p-2.5 text-sm font-mono"
+                      placeholder="Escanea el código de la caja"
+                    />
                   </div>
                 </div>
 
